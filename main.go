@@ -1,162 +1,218 @@
 package main
 
 import (
-	"errors"
-	"fmt"
+	"bytes"
+	"log"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/satori/go.uuid"
 )
 
-// http升级websocket协议的配置
-var wsUpgrader = websocket.Upgrader{
+var upgrader = websocket.Upgrader{
 	// 允许所有CORS跨域请求
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
 }
 
-// 客户端读写消息
-type wsMessage struct {
-	messageType int
-	data        []byte
+var (
+	newline = []byte{'\n'}
+	space   = []byte{' '}
+)
+
+const (
+	// Time allowed to write a message to the peer.
+	writeWait = 10 * time.Second
+
+	// Time allowed to read the next pong message from the peer.
+	pongWait = 60 * time.Second
+
+	// Send pings to peer with this period. Must be less than pongWait.
+	pingPeriod = (pongWait * 9) / 10
+
+	// Maximum message size allowed from peer.
+	maxMessageSize = 512
+)
+
+//client node define
+type Client struct {
+	//client conn
+	conn *websocket.Conn
+	//client id
+	from_user_id string
+	//to_id
+	to_user_id string
+	//last time
+	active_time time.Time
+	//group id
+	group_id string
+	//is_worker
+	is_worker bool
+	//send buffer
+	send []byte
+	//group
+	group *Group
 }
 
-// 客户端连接
-type wsConnection struct {
-	wsSocket *websocket.Conn // 底层websocket
-	inChan   chan *wsMessage // 读队列
-	outChan  chan *wsMessage // 写队列
+//Group maintains the set of active clients and workers
+type Group struct {
+	//id to client.
+	id_conn *sync.Map
 
-	mutex     sync.Mutex // 避免重复关闭管道
-	isClosed  bool
-	closeChan chan byte // 关闭通知
+	//conn to client
+	conn_client *sync.Map
+
+	//Active Clients count
+	client_cnt int
+
+	// Inbound messages from the clients.
+	broadcast chan *Client
+
+	// Register requests from the clients.
+	client_register chan *Client
+
+	// Unregister requests from clients.
+	client_unregister chan *Client
 }
 
-func (wsConn *wsConnection) wsReadLoop() {
+func newGroup() *Group {
+	return &Group{
+		broadcast:  make(chan *Client),
+		client_cnt: 0,
+
+		client_register:   make(chan *Client),
+		client_unregister: make(chan *Client),
+
+		id_conn:     &sync.Map{},
+		conn_client: &sync.Map{},
+	}
+}
+
+func (h *Group) run() {
 	for {
-		// 读一个message
-		msgType, data, err := wsConn.wsSocket.ReadMessage()
-		if err != nil {
-			goto error
-		}
-		req := &wsMessage{
-			msgType,
-			data,
-		}
-		// 放入请求队列
 		select {
-		case wsConn.inChan <- req:
-		case <-wsConn.closeChan:
-			goto closed
+		case client := <-h.client_register:
+			h.id_conn.Store(client.from_user_id, client.conn)
+			h.conn_client.Store(client.conn, client)
+			h.client_cnt++
+
+		case client := <-h.client_unregister:
+			if _, ok := h.conn_client.Load(client.conn); ok {
+				h.id_conn.Delete(client.from_user_id)
+				h.conn_client.Delete(client.conn)
+				h.client_cnt--
+			}
+		case client := <-h.broadcast:
+			log.Println("Recv a Message===>,完成决策=====》", string(client.send))
+			// w, err := client.conn.NextWriter(websocket.TextMessage)
+			// if err != nil {
+			// 	log.Println(err.Error())
+			// }
+			// w.Write([]byte(client.send))
+			// w.Write(newline)
+			// w.Close()
+
+			h.broadcast <- client
 		}
 	}
-error:
-	wsConn.wsClose()
-closed:
 }
 
-func (wsConn *wsConnection) wsWriteLoop() {
-	for {
-		select {
-		// 取一个应答
-		case msg := <-wsConn.outChan:
-			// 写给websocket
-			if err := wsConn.wsSocket.WriteMessage(msg.messageType, msg.data); err != nil {
-				goto error
-			}
-		case <-wsConn.closeChan:
-			goto closed
-		}
-	}
-error:
-	wsConn.wsClose()
-closed:
-}
-
-func (wsConn *wsConnection) procLoop() {
-	// 启动一个gouroutine发送心跳
-	go func() {
-		for {
-			time.Sleep(2 * time.Second)
-			if err := wsConn.wsWrite(websocket.TextMessage, []byte("heartbeat from server")); err != nil {
-				fmt.Println("heartbeat fail")
-				wsConn.wsClose()
-				break
-			}
-		}
+// readPump pumps messages from the websocket connection to the hub.
+//
+// The application runs readPump in a per-connection goroutine. The application
+// ensures that there is at most one reader on a connection by executing all
+// reads from this goroutine.
+func (c *Client) readPump() {
+	defer func() {
+		log.Println("Disconnect.....")
+		c.group.client_unregister <- c
+		c.conn.Close()
 	}()
 
-	// 这是一个同步处理模型（只是一个例子），如果希望并行处理可以每个请求一个gorutine，注意控制并发goroutine的数量!!!
+	c.conn.SetReadLimit(maxMessageSize)
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		log.Println("Pong Hander...")
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
 	for {
-		msg, err := wsConn.wsRead()
+		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			fmt.Println("read fail")
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("error: %v", err)
+			}
+			log.Println("readPump--->", err.Error())
 			break
 		}
-		fmt.Println(string(msg.data))
-		err = wsConn.wsWrite(msg.messageType, msg.data)
-		if err != nil {
-			fmt.Println("write fail")
-			break
+		message = bytes.TrimSpace(bytes.Replace(message, newline, space, -1))
+		c.send = message
+		c.group.broadcast <- c
+	}
+}
+
+//writePump pumps messages from the hub to the websocket connection.
+
+func (c *Client) writePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		c.group.client_unregister <- c
+		ticker.Stop()
+		c.conn.Close()
+	}()
+	for {
+		log.Println("Write Dumpling....")
+		select {
+		case client := <-c.group.broadcast:
+			w, err := client.conn.NextWriter(websocket.TextMessage)
+			if err != nil {
+				return
+			}
+			w.Write(client.send)
+			// Add queued chat messages to the current websocket message.
+			if err := w.Close(); err != nil {
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			log.Println("ping....")
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }
 
-func wsHandler(resp http.ResponseWriter, req *http.Request) {
-	// 应答客户端告知升级连接为websocket
-	wsSocket, err := wsUpgrader.Upgrade(resp, req, nil)
+// serveWs handles websocket requests from the peer.
+func serveWs(hub *Group, w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		log.Println(err)
 		return
 	}
-	wsConn := &wsConnection{
-		wsSocket:  wsSocket,
-		inChan:    make(chan *wsMessage, 1000),
-		outChan:   make(chan *wsMessage, 1000),
-		closeChan: make(chan byte),
-		isClosed:  false,
-	}
+	u1 := uuid.Must(uuid.NewV4())
+	log.Println("Has a new Connection...")
+	client := &Client{group: hub, conn: conn, from_user_id: u1.String(), send: make([]byte, 0)}
+	client.group.client_register <- client
+	// new goroutines.
+	go client.writePump()
+	go client.readPump()
 
-	// 处理器
-	go wsConn.procLoop()
-	// 读协程
-	go wsConn.wsReadLoop()
-	// 写协程
-	go wsConn.wsWriteLoop()
-}
-
-func (wsConn *wsConnection) wsWrite(messageType int, data []byte) error {
-	select {
-	case wsConn.outChan <- &wsMessage{messageType, data}:
-	case <-wsConn.closeChan:
-		return errors.New("websocket closed")
-	}
-	return nil
-}
-
-func (wsConn *wsConnection) wsRead() (*wsMessage, error) {
-	select {
-	case msg := <-wsConn.inChan:
-		return msg, nil
-	case <-wsConn.closeChan:
-	}
-	return nil, errors.New("websocket closed")
-}
-
-func (wsConn *wsConnection) wsClose() {
-	wsConn.wsSocket.Close()
-
-	wsConn.mutex.Lock()
-	defer wsConn.mutex.Unlock()
-	if !wsConn.isClosed {
-		wsConn.isClosed = true
-		close(wsConn.closeChan)
-	}
 }
 
 func main() {
-	http.HandleFunc("/ws", wsHandler)
+
+	hub := newGroup()
+	go hub.run()
+
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		serveWs(hub, w, r)
+	})
+	log.Println("Start....")
 	http.ListenAndServe("0.0.0.0:7777", nil)
 }
