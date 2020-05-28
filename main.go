@@ -109,24 +109,12 @@ func (h *Group) run() {
 			}
 		case client := <-h.broadcast:
 			log.Println("Recv a Message===>,完成决策=====》", string(client.send))
-			// w, err := client.conn.NextWriter(websocket.TextMessage)
-			// if err != nil {
-			// 	log.Println(err.Error())
-			// }
-			// w.Write([]byte(client.send))
-			// w.Write(newline)
-			// w.Close()
-
 			h.broadcast <- client
 		}
 	}
 }
 
 // readPump pumps messages from the websocket connection to the hub.
-//
-// The application runs readPump in a per-connection goroutine. The application
-// ensures that there is at most one reader on a connection by executing all
-// reads from this goroutine.
 func (c *Client) readPump() {
 	defer func() {
 		log.Println("Disconnect.....")
