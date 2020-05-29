@@ -1,22 +1,13 @@
 package main
 
 import (
-	"bytes"
+	"encoding/json"
 	"log"
-	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
-
-var upgrader = websocket.Upgrader{
-	// 允许所有CORS跨域请求
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-}
 
 var (
 	newline = []byte{'\n'}
@@ -35,6 +26,9 @@ const (
 
 	// Maximum message size allowed from peer.
 	maxMessageSize = 512
+
+	MSG_TEXT   = 1
+	MSG_SIGNIN = 2
 )
 
 //client node define
@@ -48,19 +42,35 @@ type Client struct {
 	//last time
 	//group id
 	group_id string
-	//is_worker
-	is_worker bool
 	//send buffer
 	send []byte
 	//group
 	group *Group
+	//is worker
+	is_worker bool
+	lock      sync.Mutex
+}
+
+type Msg struct {
+	UserId     string `json:"user_id"`
+	MsgType    int    `json:"msg_type"`
+	MsgContent string `json:"msg"`
+}
+
+type MsgResp struct {
+	ErrCode string `json:"err_code"`
+	ErrMsg  string `json:"err_msg"`
 }
 
 // readPump pumps messages from the websocket connection to the hub.
 func (c *Client) readPump() {
 	defer func() {
-		log.Println("Read Disconnect.....")
-		c.group.client_unregister <- c
+		log.Println("Read clean......")
+		if c.is_worker {
+			c.group.worker_unregister <- c
+		} else {
+			c.group.client_unregister <- c
+		}
 		c.conn.Close()
 	}()
 
@@ -70,56 +80,61 @@ func (c *Client) readPump() {
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
-	i := 0
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("error: %v", err)
 			}
-			log.Println("readPump--->", err.Error())
 			break
 		}
-		message = bytes.TrimSpace(bytes.Replace(message, newline, space, -1))
-		log.Println(string(message)+"=======>", i)
-		i++
-		//c.send = message
-		c.group.message <- string(message)
+		c.send = []byte(c.handler(message))
+		c.group.read_user <- c
 	}
 }
 
-//writePump pumps messages from the hub to the websocket connection.
+// readPump pumps messages from the websocket connection to the hub.
+func (c *Client) handler(message []byte) string {
+	var msg Msg
+	if err := json.Unmarshal(message, &msg); err != nil {
+		log.Println("json Unmarshal Error")
+	}
+	switch msg.MsgType {
+	case MSG_TEXT:
+	case MSG_SIGNIN:
+	}
+	return msg.MsgContent
+}
 
+//writePump pumps messages from the hub to the websocket connection.
 func (c *Client) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
-		c.group.client_unregister <- c
+		log.Println("Write clean......")
+		if c.is_worker {
+			c.group.worker_unregister <- c
+		} else {
+			c.group.client_unregister <- c
+		}
 		ticker.Stop()
 		c.conn.Close()
 	}()
 	for {
 		select {
-		case client := <-c.group.from_user:
+		case client := <-c.group.write_user:
+			log.Println("==========>")
+			c.lock.Lock()
 			w, err := client.conn.NextWriter(websocket.TextMessage)
 			if err != nil {
 				return
 			}
 			w.Write(client.send)
-			// Add queued chat messages to the current websocket message.
+			w.Write(newline)
 			if err := w.Close(); err != nil {
 				return
 			}
-		case other_client := <-c.group.to_user:
-			log.Println("get to_user.....", string(other_client.send))
-			w, err := other_client.conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			w.Write(other_client.send)
-			// Add queued chat messages to the current websocket message.
-			if err := w.Close(); err != nil {
-				return
-			}
+			c.lock.Unlock()
+
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
