@@ -1,7 +1,8 @@
 package main
 
 import (
-	"log"
+	"encoding/json"
+	"fmt"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -9,6 +10,9 @@ import (
 
 //Group maintains the set of active clients and workers
 type Group struct {
+	//group_id
+	group_id string
+
 	//id to client.
 	client_id_conn *sync.Map
 
@@ -48,8 +52,9 @@ type Group struct {
 	worker_unregister chan *Client
 }
 
-func newGroup() *Group {
+func newGroup(group_id string) *Group {
 	return &Group{
+		group_id: group_id,
 
 		read_user:  make(chan *Client, 1),
 		write_user: make(chan *Client, 10),
@@ -75,86 +80,133 @@ func (h *Group) run() {
 	for {
 		select {
 		case client := <-h.client_register:
-			log.Println("Client Register....")
+			PrintInfo("Client Register....")
 			h.client_id_conn.Store(client.from_user_id, client.conn)
 			h.client_conn_client.Store(client.conn, client)
 			h.client_cnt++
 			h.total_cnt++
-
+			h.worker_conn_client.Range(func(k, v interface{}) bool {
+				client, _ := v.(*Client)
+				client.send = h.getClients()
+				h.write_user <- client
+				return true
+			})
 		case client := <-h.client_unregister:
-			log.Println("Client UnRegister....")
+			PrintInfo("Client UnRegister....")
 			if _, ok := h.client_id_conn.Load(client.from_user_id); ok {
 				h.client_id_conn.Delete(client.from_user_id)
 				h.client_conn_client.Delete(client.conn)
 				h.client_cnt--
 				h.total_cnt--
-			} else {
-				log.Println("Client UnRegistered")
+				h.worker_conn_client.Range(func(k, v interface{}) bool {
+					client, _ := v.(*Client)
+					client.send = h.getClients()
+					h.write_user <- client
+					return true
+				})
 			}
-
 		case worker := <-h.worker_register:
-			log.Println("Worker Register....")
+			PrintInfo("Worker Register....")
 			h.worker_id_conn.Store(worker.from_user_id, worker.conn)
 			h.worker_conn_client.Store(worker.conn, worker)
 			h.worker_cnt++
 			h.total_cnt++
 
 		case worker := <-h.worker_unregister:
-			log.Println("Worker UnRegister....")
+			PrintInfo("Worker UnRegister....")
 			if _, ok := h.worker_id_conn.Load(worker.from_user_id); ok {
 				h.worker_id_conn.Delete(worker.from_user_id)
 				h.worker_conn_client.Delete(worker.conn)
 				h.worker_cnt--
 				h.total_cnt--
-			} else {
-				log.Println("Worker UnRegistered")
 			}
 		case client := <-h.read_user:
-			log.Println("is_worker====>", client.is_worker)
 			if client.is_worker {
-				log.Println("坐席发起的消息")
-				if client.to_user_id != "" {
-					log.Println("有过交流")
-				}
-			}
-			if !client.is_worker {
-				log.Println("客户发起的消息======>")
-				h.write_user <- client
-				c := h.getClient(client.from_user_id, client.to_user_id)
-				if c == nil {
-					log.Println("机器人应答消息")
-					r := new(Client)
-					r.conn = client.conn
-					r.group = client.group
-					r.send = []byte(h.getRobotMsg(string(client.send)))
-					h.write_user <- r
-				} else {
-					client.to_user_id = c.from_user_id
-					c.to_user_id = client.from_user_id
-					c.send = []byte(string(client.send) + "hello.....")
-					h.write_user <- c
-				}
+				h.doWorker(client, client.send)
+			} else {
+				h.doClient(client, client.send)
 			}
 		}
 	}
 }
 
 /*
+	客服的处理
+*/
+func (h *Group) doWorker(client *Client, message []byte) {
+	PrintHead("DoWorker")
+	var text MsgText
+	json.Unmarshal([]byte(string(client.send)), &text)
+	switch text.MsgType {
+	case MSG_TEXT:
+		h.write_user <- client
+		c := h.getClientById(text.ToUserId)
+		if c == nil {
+			PrintInfo("必须选择一个用户--->")
+			h.write_user <- client
+		} else {
+			c.send = client.send
+			h.write_user <- c
+		}
+	case MSG_USER_LIST:
+		client.send = h.getClients()
+		h.write_user <- client
+	}
+	PrintTail("DoWorker")
+}
 
- */
-func (h *Group) getClient(from_user_id string, to_user_id string) *Client {
+/*
+  访客的处理
+*/
+func (h *Group) doClient(client *Client, message []byte) {
+	PrintHead("DoClient")
+	var header MsgHeader
+	json.Unmarshal(message, &header)
+	switch header.MsgType {
+	case MSG_USER_ID:
+		PrintInfo("获取用户Id")
+		var getUser MsgGetUserId
+		getUser.FromUserId = client.from_user_id
+		getUser.ToUserId = client.from_user_id
+		getUser.MsgType = header.MsgType
+		msgBuf, _ := json.Marshal(getUser)
+		client.send = msgBuf
+		h.write_user <- client
+	case MSG_TEXT:
+		h.write_user <- client
+		var text MsgText
+		json.Unmarshal([]byte(string(client.send)), &text)
+		worker := h.getWorker(text.ToUserId)
+		if worker != nil {
+			text.ToUserId = worker.from_user_id
+			msgBuf, _ := json.Marshal(text)
+			worker.send = msgBuf
+			h.write_user <- worker
+		} else {
+			r := new(Client)
+			r.conn = client.conn
+			r.group = client.group
+			r.send = []byte("")
+			h.write_user <- r
+		}
+	}
+	PrintTail("DoClient")
+}
+
+/*
+  得到一个客服节点信息，如果没有在线的有机器来处理
+*/
+func (h *Group) getWorker(to_user_id string) *Client {
 	var newClient *Client
 	if to_user_id != "" {
 		ct, ok := h.worker_id_conn.Load(to_user_id)
 		if ok {
-			log.Println("得到之前的客服=====>")
 			conn, _ := ct.(*websocket.Conn)
 			nt, _ := h.worker_conn_client.Load(conn)
 			node, _ := nt.(*Client)
 			return node
 		}
 	}
-	//首次从客服池子获取
 	var bfind bool
 	h.worker_conn_client.Range(func(k, v interface{}) bool {
 		worker, _ := v.(*Client)
@@ -163,14 +215,45 @@ func (h *Group) getClient(from_user_id string, to_user_id string) *Client {
 		return false
 	})
 	if bfind {
-		log.Println("从池子获取客服")
 		return newClient
+	}
+	//交给机器处理
+	return nil
+}
+
+/*
+	根据访客的ID得到访客节点信息
+*/
+func (h *Group) getClientById(to_user_id string) *Client {
+	ct, ok := h.client_id_conn.Load(to_user_id)
+	if ok {
+		conn, _ := ct.(*websocket.Conn)
+		nt, ok := h.client_conn_client.Load(conn)
+		node, ok := nt.(*Client)
+		if !ok {
+			return nil
+		}
+		return node
 	}
 	return nil
 }
 
-func (h *Group) getRobotMsg(input_msg string) string {
-
-	return input_msg + "hello"
-
+/*
+	得到访问用户的列表
+*/
+func (h *Group) getClients() []byte {
+	var users MsgGetUsers
+	t := 0
+	h.client_conn_client.Range(func(k, v interface{}) bool {
+		client, _ := v.(*Client)
+		t++
+		var u User
+		u.UserId = client.from_user_id
+		u.UserName = "访客" + fmt.Sprintf("%d", t)
+		users.Users = append(users.Users, u)
+		return true
+	})
+	users.MsgType = MSG_USER_LIST
+	msgBuf, _ := json.Marshal(users)
+	return msgBuf
 }
